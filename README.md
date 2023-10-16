@@ -1,8 +1,8 @@
 # σ-MoE layer
 
-A simple version our $\sigma$-MoE layer from the paper "Approximating Two-Layer Feedforward Networks for Efficient Transformers".
+A simple version of our $\sigma$-MoE layer from the paper "Approximating Two-Layer Feedforward Networks for Efficient Transformers". It is intended to replace the feedforward block (linear-activation-linear stack) in the Transformer. No layernorm or residual connection is included internally.
 
-The current version only supports float32 ops without tensorcores. 
+The current version only supports float32 ops without tensor cores.
 
 **An much faster OpenAI Triton-based implementation supporting float16 and tensor cores is coming soon.**
 
