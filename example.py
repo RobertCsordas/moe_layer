@@ -1,5 +1,6 @@
 import torch
-from moe_layer import MoE
+from triton_src.moe_layer import MoE
+# from cuda_src.moe_layer import MoE
 
 bs = 64
 seq_len = 512

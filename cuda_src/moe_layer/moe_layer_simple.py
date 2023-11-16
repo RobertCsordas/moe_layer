@@ -111,7 +111,7 @@ class MoE(torch.nn.Module):
         if self.selection_mode == "sinkmoid":
             if self.training:
                 with torch.no_grad():
-                    sel = self.sinkhorn_unnorm(sel, False)
+                    sel = self.sinkhorn_unnorm(sel)
             else:
                 sel = torch.sigmoid(sel)
         elif self.selection_mode == "sigmoid":

@@ -2,9 +2,15 @@
 
 A simple version of our $\sigma$-MoE layer from the paper "Approximating Two-Layer Feedforward Networks for Efficient Transformers". It is intended to replace the feedforward block (linear-activation-linear stack) in the Transformer. No layernorm or residual connection is included internally.
 
-The current version only supports float32 ops without tensor cores.
+# Choosing the implementation
 
-**An much faster OpenAI Triton-based implementation supporting float16 and tensor cores is coming soon.**
+## Triton (recommended)
+
+A fast Triton based implementation is avaliable under the directory `triton_src`. However it requrest PyTorch 2.1 and Triton 2.1. The minimal supported compute capability is 7.0 (Volta). Due to a known bug in Triton (https://github.com/openai/triton/issues/2377), it is ~1.5x slower on Volta than it should be. Even with this bug, it is faster than the CUDA implementation.
+
+## CUDA
+
+Works on any CUDA compatible GPU (them minimal tested version was Pascal) and most of the recent PyTorch releases. However it is significantly slower than the Triton implementation, and it lacks TensorCore support. It can be found in the `cuda_src` folder.
 
 # Usage
 
