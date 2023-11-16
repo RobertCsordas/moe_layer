@@ -1,6 +1,8 @@
 # σ-MoE layer
 
-A simple version of our $\sigma$-MoE layer from the paper "Approximating Two-Layer Feedforward Networks for Efficient Transformers". It is intended to replace the feedforward block (linear-activation-linear stack) in the Transformer. No layernorm or residual connection is included internally.
+A simple version of our $\sigma$-MoE layer from the paper "Approximating Two-Layer Feedforward Networks for Efficient Transformers" (https://arxiv.org/abs//2310.10837). It is intended to replace the feedforward block (linear-activation-linear stack) in the Transformer. No layernorm or residual connection is included internally.
+
+For the full experimental setup, please visit https://github.com/robertcsordas/moe.
 
 # Choosing the implementation
 
