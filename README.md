@@ -14,6 +14,10 @@ A fast Triton based implementation is avaliable under the directory `triton_src`
 
 Works on any CUDA compatible GPU (them minimal tested version was Pascal) and most of the recent PyTorch releases. However it is significantly slower than the Triton implementation, and it lacks TensorCore support. It can be found in the `cuda_src` folder.
 
+## torch.compile
+
+Currently, torch.compile is supported with the Triton implementation, but it requires at least PyTorch 2.2.0-dev (nighly). It also breaks the grap. The PyTorch team is actively working on resolving the remaining issues: https://github.com/pytorch/pytorch/issues/115344.
+
 # Usage
 
 ```python

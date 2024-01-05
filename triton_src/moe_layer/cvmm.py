@@ -5,7 +5,7 @@ import triton
 import triton.language as tl
 
 # Based on https://github.com/openai/triton/blob/main/python/tutorials/03-matrix-multiplication.py
-
+# torch.compile() fixes by Julian Büchel <jub@zurich.ibm.com>, based on https://github.com/pytorch/pytorch/issues/115344
 
 @dataclass
 class CVMMSel:
@@ -25,12 +25,6 @@ def cvmm_prepare_sel(sel: torch.Tensor, n_experts: int) -> CVMMSel:
     return CVMMSel(sel, ssel.view_as(sel), sel_index, None)
 
 
-
-# `triton.jit`'ed functions can be auto-tuned by using the `triton.autotune` decorator, which consumes:
-#   - A list of `triton.Config` objects that define different configurations of
-#       meta-parameters (e.g., `BLOCK_SIZE_M`) and compilation options (e.g., `num_warps`) to try
-#   - An auto-tuning *key* whose change in values will trigger evaluation of all the
-#       provided configs
 @triton.autotune(
     configs=[
         triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8),
@@ -59,6 +53,7 @@ def cvmm_kernel(
     stride_bo, stride_bk, stride_bn,
     stride_cm, stride_cn,
     stride_index, stride_sel, stride_out_index,
+    out_index_is_none: tl.constexpr,
     float32: tl.constexpr, allow_tf32: tl.constexpr,
     # Meta-parameters
     BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
@@ -138,20 +133,15 @@ def cvmm_kernel(
         # Write back the block of the output matrix C with masks.
         offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
 
-        if out_index_ptr is not None:
-            remap_offs_cm = tl.load(out_index_ptr + stride_out_index * offs_am)
-        else:
+        if out_index_is_none:
             remap_offs_cm = remap_offs_am
+        else:
+            remap_offs_cm = tl.load(out_index_ptr + stride_out_index * offs_am)
 
         offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
         c_ptrs = c_ptr + stride_cm * remap_offs_cm[:, None] + stride_cn * offs_cn[None, :]
         c_mask = ((offs_cm[:, None] < M) & (sel_all[:, None] == matrix_id)) & (offs_cn[None, :] < N)
         tl.store(c_ptrs, c, mask=c_mask)
-
-
-
-
-
 
 
 @triton.autotune(
@@ -190,6 +180,7 @@ def cvmm_backward_kernel3(
     stride_bk, stride_bn,
     stride_co, stride_cm, stride_cn,
     stride_index, stride_sel, stride_out_index,
+    out_index_is_none: tl.constexpr,
     float32_out: tl.constexpr, allow_tf32: tl.constexpr, op_float16: tl.constexpr,
     # Meta-parameters
     BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
@@ -289,10 +280,10 @@ def cvmm_backward_kernel3(
                 block_mem_indices_f = block_mem_indices_f_base + k * BLOCK_SIZE_K
                 block_mem_indices = block_mem_indices_f % K
                 a_index = tl.load(index_ptr + stride_index * block_mem_indices)
-                if out_index_ptr is not None:
-                    b_index = tl.load(out_index_ptr + stride_out_index * block_mem_indices)
-                else:
+                if out_index_is_none:
                     b_index = a_index
+                else:
+                    b_index = tl.load(out_index_ptr + stride_out_index * block_mem_indices)
                 sel_ok = block_mem_indices_f < end_i
 
                 a_ptrs = a_ptrs_this + a_index[None, :] * stride_ak
@@ -325,9 +316,17 @@ def cvmm_backward_kernel3(
             tl.atomic_add(c_ptrs, c, mask=c_mask)
 
 
+torch.library.define("mylib::cvmm_triton", "(Tensor x, Tensor sel_index, Tensor sel, Tensor keys, ScalarType out_dtype, Tensor out_index) -> Tensor")
 
-def cvmm_triton(x: torch.Tensor, sel_index: torch.Tensor, sel: torch.Tensor, keys: torch.Tensor, out_dtype: torch.dtype, out_index: Optional[torch.Tensor] = None):
-    xorig = x
+@torch.library.impl("mylib::cvmm_triton", "default")
+def cvmm_triton(
+    x: torch.Tensor,
+    sel_index: torch.Tensor,
+    sel: torch.Tensor,
+    keys: torch.Tensor,
+    out_dtype: torch.dtype,
+    out_index: torch.Tensor
+):
     x = x.flatten(end_dim=-2)
     assert x.shape[-1] == keys.shape[1]
 
@@ -348,35 +347,61 @@ def cvmm_triton(x: torch.Tensor, sel_index: torch.Tensor, sel: torch.Tensor, key
         triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']),
     )
 
+    out_index_is_none = False
+    if out_index.numel() == 1 and out_index == -1:
+        out_index_is_none = True
+
     cvmm_kernel[grid](
         x, keys, out, sel_index, sel, out_index,
         M, N, K,
         x.stride(0), x.stride(1),
         keys.stride(0), keys.stride(1), keys.stride(2),
         out.stride(0), out.stride(1),
-        sel_index.stride(0), sel.stride(0), out_index.stride(0) if out_index is not None else 0,
+        sel_index.stride(0), sel.stride(0), 0 if out_index_is_none else out_index.stride(0),
+        out_index_is_none=out_index_is_none,
         float32=out.dtype==torch.float32, allow_tf32=False, #torch.backends.cuda.matmul.allow_tf32
     )
 
     return out.view(*sel_shape, N)
 
 
-def cvmm_triton_backward(x: torch.Tensor, sel_index: torch.Tensor, sel: torch.Tensor, grads: torch.Tensor, n_experts: int, key_dtype: torch.dtype,
-                         op_float16: bool, out_index: Optional[torch.Tensor] = None):
+@torch.library.impl_abstract("mylib::cvmm_triton", cvmm_triton)
+def cvmm_triton_abstract(x, sel_idx, sel, keys, out_dtype, out_index):
+    sel_shape = sel.shape
+    sel = sel.flatten()
+    M = sel.shape[0]
+    O, K, N = keys.shape
+    out = torch.empty((M, N), device=x.device, dtype=out_dtype)
+    sel_shape = sel.shape
+    return out.view(*sel_shape, N)
+
+
+# torch.library.define("mylib::cvmm_triton_backward", "(Tensor x, Tensor sel_index, Tensor sel, Tensor grads, int n_experts, ScalarType key_dtype, bool op_float16, Tensor out_index) -> Tensor")
+
+# @torch.library.impl("mylib::cvmm_triton_backward", "default")
+def cvmm_triton_backward(
+    x: torch.Tensor,
+    sel_index: torch.Tensor,
+    sel: torch.Tensor,
+    grads: torch.Tensor,
+    n_experts: int,
+    key_dtype: torch.dtype,
+    op_float16: bool,
+    out_index: torch.Tensor
+):
     x = x.flatten(end_dim=-2)
     x = x.transpose(0, 1)
-
     grads = grads.flatten(end_dim=-2)
     sel = sel.flatten()
-
     M, _ = x.shape
     K, N = grads.shape
-
     out = torch.zeros((n_experts, M, N), device=x.device, dtype=key_dtype)
-
     grid = lambda META: (
         triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']), triton.cdiv(K, META['BLOCK_SIZE_K'] * META['K_BLOCKS'])
     )
+    out_index_is_none = False
+    if out_index.numel() == 1 and out_index == -1:
+        out_index_is_none = True
 
     cvmm_backward_kernel3[grid](
         x, grads, out, sel_index, sel, out_index,
@@ -384,29 +409,35 @@ def cvmm_triton_backward(x: torch.Tensor, sel_index: torch.Tensor, sel: torch.Te
         x.stride(0), x.stride(1),
         grads.stride(0), grads.stride(1),
         out.stride(0), out.stride(1), out.stride(2),
-        sel_index.stride(0), sel.stride(0), out_index.stride(0) if out_index is not None else 0,
+        sel_index.stride(0), sel.stride(0), 0 if out_index_is_none else out_index.stride(0),
+        out_index_is_none=out_index_is_none,
         float32_out=out.dtype == torch.float32,
         op_float16=op_float16,
         allow_tf32=False #torch.backends.cuda.matmul.allow_tf32
     )
-
     return out
-
-
 
 
 class CVMM(torch.autograd.Function):
     warned = False
 
     @staticmethod
-    def forward(ctx, x: torch.Tensor, sel_index: torch.Tensor, sel: torch.Tensor, keys: torch.Tensor, out_index: Optional[torch.Tensor] = None, reduction_weight: Optional[torch.Tensor] = None):
+    def forward(
+        ctx,
+        x: torch.Tensor,
+        sel_index: torch.Tensor,
+        sel: torch.Tensor,
+        keys: torch.Tensor,
+        out_index: Optional[torch.Tensor] = None,
+        reduction_weight: Optional[torch.Tensor] = None
+    ):
         ctx.save_for_backward(x, keys, sel, sel_index, out_index, reduction_weight)
-
         out_type = torch.float16 if torch.is_autocast_enabled() else x.dtype
-        # if torch.is_autocast_enabled():
-        #     x = x.half()
-        #     keys = keys.half()
-        res = cvmm_triton(x, sel_index, sel, keys, out_type, out_index)
+        if out_index is None:
+            out_index = torch.tensor(-1).cuda()
+
+        res = torch.ops.mylib.cvmm_triton(x, sel_index, sel, keys, out_type, out_index)
+
         if reduction_weight is not None:
             res = res.view(*reduction_weight.shape, res.shape[-1])
             res = (reduction_weight.unsqueeze(-2).type_as(res) @ res).squeeze(-2)
@@ -419,14 +450,6 @@ class CVMM(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         x, keys, sel, sel_index, out_index, reduction_weight = ctx.saved_tensors
-
-        # if torch.is_autocast_enabled():
-        #     x = x.half()
-        #     keys = keys.half()
-        #     grad_output = grad_output.half()
-
-        # x = x.type(ctx.op_type)
-        # keys_dt = keys.type_as(x)
         keys_dt = keys
 
         # Backward for weight
@@ -436,19 +459,40 @@ class CVMM(torch.autograd.Function):
         else:
             grad_output_w  = grad_output
 
-        grad_w = cvmm_triton_backward(x, sel_index, sel, grad_output_w, keys_dt.shape[0], ctx.keys_type, ctx.is_autocast, out_index=out_index)
+        out_index_is_none = False
+        if out_index is None:
+            out_index_is_none = True
+            out_index = torch.tensor(-1).cuda()
+
+        grad_w = cvmm_triton_backward(
+            x,
+            sel_index,
+            sel,
+            grad_output_w,
+            keys_dt.shape[0],
+            ctx.keys_type,
+            ctx.is_autocast,
+            out_index=out_index
+        )
 
         # Backward for input and reduction weight
         grad_w_off = None
 
-        bw_index = sel_index if out_index is None else out_index
-        bw_index_out = None
+        bw_index = sel_index if out_index_is_none else out_index
+        bw_index_out = torch.tensor(-1).cuda()
         if reduction_weight is not None:
             # Hack the output indices to emulate repeats
             bw_index_out = bw_index
             bw_index = bw_index // reduction_weight.shape[-1]
 
-        grad_x_full = cvmm_triton(grad_output, bw_index, sel, keys_dt.transpose(1,2), ctx.op_type, bw_index_out)
+        grad_x_full = torch.ops.mylib.cvmm_triton(
+            grad_output,
+            bw_index,
+            sel,
+            keys_dt.transpose(1,2),
+            ctx.op_type,
+            bw_index_out
+        )
 
         grad_x_full = grad_x_full.view(*x.shape[:-1], -1, x.shape[-1])
         if reduction_weight is not None:
@@ -487,430 +531,3 @@ def cvmm_prepare_sel2(sel: torch.Tensor, w: Optional[torch.Tensor] = None) -> CV
     in_index = sel_index // n_per_batch
 
     return CVMMSel(sel, ssel.view_as(sel), in_index, sel_index, w)
-
-
-
-
-if __name__ == "__main__":
-    def cvmm_hack(x: torch.Tensor, sel: Union[torch.Tensor, CVMMSel], keys: torch.Tensor):
-        if not isinstance(sel, CVMMSel):
-            sel = cvmm_prepare_sel(sel, keys.shape[0])
-
-        sh = (x.shape, keys.shape)
-        if sh not in known_shapes:
-            print("New shape:", sh)
-            known_shapes.add(sh)
-
-        res = CVMM.apply(x, sel.sel_index, sel.sel, keys, sel.out_index, None)
-        if sel.reduction_weight is not None:
-            res = res.view(*sel.reduction_weight.shape, res.shape[-1])
-            res = (sel.reduction_weight.unsqueeze(-2).type_as(res) @ res).squeeze(-2)
-        return res
-
-    def test_wsum():
-        n_experts = 2
-        n_channels = 3
-        expert_size = 3
-        bs = 2
-
-        # n_experts = 8
-        # n_channels = 64
-        # expert_size = 64
-        # bs = 32
-
-        # n_per_batch = 1
-
-        n_per_batch = 2
-        # reduction_factor = 2
-        reduction_factor = 1
-
-        device = torch.device("cuda")
-        dtype = torch.float32
-        atol_tresh = 1e-2
-
-        keys = torch.nn.Parameter(torch.randn(n_experts, n_channels, expert_size, dtype=dtype, device=device))
-        testvec = torch.randn(bs, n_channels, dtype=dtype, device=device)
-        sel_raw = torch.randint(0, n_experts, (bs,n_per_batch), dtype=torch.int32, device=device)
-
-        # w = torch.randn_like(sel, dtype=torch.float32)
-        w = torch.randn((bs // reduction_factor, n_per_batch * reduction_factor), dtype=torch.float32, device=device)
-        # sel = torch.tensor([[1,0]], dtype=torch.int32, device=device)
-
-        sel = cvmm_prepare_sel2(sel_raw, w)
-        out = cvmm(testvec, sel, keys)
-
-        def cwmm_ref2(x: torch.Tensor, isel: Union[torch.Tensor, CVMMSel], keys: torch.Tensor):
-            if isinstance(isel, CVMMSel):
-                sel = isel.raw_sel
-                getw = lambda b, c: (isel.reduction_weight[b, c] if isel.reduction_weight is not None else 1.0)
-            else:
-                sel = isel
-                getw = lambda b, c: 1.0
-
-            olist2 = []
-            for c in range(sel.shape[-1]):
-                olist = []
-                for b in range(x.shape[0]):
-                    olist.append(x[b:b+1] @ keys[sel[b, c]] * getw(b, c))
-                olist2.append(torch.cat(olist, dim=0))
-
-            res = torch.stack(olist2, dim=-2)
-            if isinstance(isel, CVMMSel) and isel.reduction_weight is not None:
-                res = res.sum(-2)
-            return res
-
-        ref = cwmm_ref2(testvec, sel, keys)
-
-        if torch.allclose(out, ref, atol=1e-2, rtol=0):
-            print("✅ Multi-output: Triton and Torch match")
-        else:
-            print("❌ Multi-output: Triton and Torch differ")
-
-
-
-        def cvmm_ref_backward2(x: torch.Tensor, sel: CVMMSel, grads: torch.Tensor, n_experts: int):
-            sel = sel.raw_sel
-            x = x.flatten(end_dim=-2).transpose(0,1)
-
-            res = 0
-            for c in range(sel.shape[-1]):
-                gmats = []
-                for i in range(n_experts):
-                    mask = sel[:, c] != i
-                    sel_my = torch.masked_fill(x, mask[None], 0)
-                    grads_my = torch.masked_fill(grads[..., c, :], mask[:, None], 0)
-
-                    gmats.append(sel_my @ grads_my)
-
-                res += torch.stack(gmats)
-            return res
-
-
-        grad_out = torch.randn(*out.shape, dtype=dtype, device=device)
-
-        keys_ref = keys.detach().clone().requires_grad_(True)
-        testvec_ref = testvec.detach().clone().requires_grad_(True)
-        w_ref = w.detach().clone().requires_grad_(True)
-
-        sel = cvmm_prepare_sel2(sel_raw, w_ref)
-
-        print("CVMM hack")
-        out_ref = cvmm_hack(testvec_ref, sel, keys_ref)
-        out_ref.backward(grad_out)
-
-
-        keys_full = keys.detach().clone().requires_grad_(True)
-        testvec_full = testvec.detach().clone().requires_grad_(True)
-        w_full = w.detach().clone().requires_grad_(True)
-
-        sel = cvmm_prepare_sel2(sel_raw, w_full)
-
-        print("CVMM full")
-        out_full = cvmm(testvec_full, sel, keys_full)
-        out_full.backward(grad_out)
-
-        if torch.allclose(keys_ref.grad, keys_full.grad, atol=1e-2, rtol=0):
-            print("✅  Multi-output: Triton weight grad ok")
-        else:
-            print("❌  Multi-output: Triton weight grad not ok")
-
-        if torch.allclose(testvec_ref.grad, testvec_full.grad, atol=1e-2, rtol=0):
-            print("✅  Multi-output: Triton input grad ok")
-        else:
-            print("❌  Multi-output: Triton input grad not ok")
-
-        if torch.allclose(w_ref.grad, w_full.grad, atol=1e-2, rtol=0):
-            print("✅  Multi-output: Triton reduction weight grad ok")
-        else:
-            print("❌  Multi-output: Triton reduction weight grad not ok")
-
-
-
-        # g = cvmm_triton_backward(testvec, sel.sel_index, sel.sel, grad_out, keys.shape[0], keys.dtype, False, out_index=sel.out_index)
-        # gref = cvmm_ref_backward2(testvec, sel, grad_out, keys.shape[0])
-
-        # if torch.allclose(g, gref, atol=1e-2, rtol=0):
-        #     print("✅  Multi-output: Triton grad ok")
-        # else:
-        #     print("❌  Multi-output: Triton grad not ok")
-
-
-
-        from torch.autograd import gradcheck
-        assert gradcheck(cvmm, (testvec, sel, keys), eps=1e-2, atol=1e-4)
-        print("Gradcheck ok.")
-
-
-    def test_module():
-        from torch.autograd import gradcheck
-
-        n_experts = 4
-        n_channels = 64
-        expert_size = 64
-        bs = 32
-
-
-        device = torch.device("cuda")
-        dtype = torch.float32
-        atol_tresh = 1e-2
-
-        keys = torch.nn.Parameter(torch.randn(n_experts, n_channels, expert_size, dtype=dtype, device=device))
-        testvec = torch.randn(bs, n_channels, dtype=dtype, device=device)
-        sel = torch.randint(0, n_experts, (bs,), dtype=torch.int32, device=device)
-        test_grad = torch.randn(bs, expert_size, dtype=dtype, device=device)
-
-        olist = []
-        for b in range(bs):
-            olist.append(testvec[b:b+1] @ keys[sel[b]])
-        ref = torch.cat(olist, dim=0)
-
-        out = cvmm(testvec, sel, keys)
-        assert torch.allclose(ref, out, atol=atol_tresh, rtol=0)
-
-        print("Forward ok.")
-
-        keys = keys.requires_grad_(True)
-        testvec = testvec.requires_grad_(True)
-
-
-        assert gradcheck(cvmm, (testvec, sel, keys), eps=1e-2, atol=atol_tresh, rtol=0)
-
-        print("Backward ok.")
-
-    test_wsum()
-    # test_module()
-
-    def cwmm_ref(x: torch.Tensor, sel: Union[torch.Tensor, CVMMSel], keys: torch.Tensor):
-        if isinstance(sel, CVMMSel):
-            sel = sel.raw_sel
-
-        olist = []
-        for b in range(x.shape[0]):
-            olist.append(x[b:b+1] @ keys[sel[b]])
-        return torch.cat(olist, dim=0)
-
-    def test_forward():
-        torch.manual_seed(0)
-        n_experts = 8
-        n_channels = 64
-        expert_size = 64
-        bs = 64
-
-        device = torch.device("cuda")
-        dtype = torch.float16
-        atol_tresh = 1e-2
-
-        keys = torch.nn.Parameter(torch.randn(n_experts, n_channels, expert_size, dtype=dtype, device=device))
-        keys = keys.transpose(1,2).contiguous().transpose(1,2)
-        testvec = torch.randn(bs, n_channels, dtype=dtype, device=device)
-        sel = torch.randint(0, n_experts, (bs,), dtype=torch.int32, device=device)
-
-        exp_sel = torch.distributions.Geometric(0.02).sample((bs,)).to(device).clamp(max=n_experts-1).int()
-        exp_sel = torch.randperm(n_experts, device=device, dtype=torch.int32)[exp_sel]
-
-        sel = exp_sel
-        # sel = torch.tensor([0, 1], dtype=torch.int32, device=device)
-
-        sel = cvmm_prepare_sel(sel, keys.shape[0])
-
-        ref = cwmm_ref(testvec, sel, keys)
-        out = cvmm_triton(testvec, sel.sel_index, sel.sel, keys, dtype)
-
-        if torch.allclose(out, ref, atol=1e-2, rtol=0):
-            print("✅ Triton and Torch match")
-        else:
-            print("❌ Triton and Torch differ")
-
-
-        def do_benchmark(K, N):
-            @triton.testing.perf_report(
-                triton.testing.Benchmark(
-                    x_names=['bsz'],  # Argument names to use as an x-axis for the plot
-                    x_vals=[
-                        2048 * (i+2) for i in range(0, 32, 8)
-                    ]+[131072],  # Different possible values for `x_name`
-                    line_arg='provider',  # Argument name whose value corresponds to a different line in the plot
-                    # Possible values for `line_arg`
-                    line_vals=['cublas', 'triton'],
-                    # Label name for the lines
-                    line_names=["cuBLAS", "Triton"],
-                    # Line styles
-                    styles=[('green', '-'), ('blue', '-')],
-                    ylabel="TFLOPS",  # Label name for the y-axis
-                    plot_name="matmul-performance",  # Name for the plot, used also as a file name for saving the plot.
-                    args={},
-                )
-            )
-            def benchmark(bsz, provider):
-                # a = torch.randn((M, K), device='cuda', dtype=torch.float16)
-                # b = torch.randn((K, N), device='cuda', dtype=torch.float16)
-                dtype = torch.float32 if provider == 'cuda' else torch.float16
-                keys = torch.nn.Parameter(torch.randn(n_experts, K, N, dtype=dtype, device=device))
-                testvec = torch.randn(bsz, K, dtype=dtype, device=device)
-                sel = torch.randint(0, n_experts, (bsz,), dtype=torch.int32, device=device)
-                keys = keys.transpose(1,2).contiguous().transpose(1,2)
-
-                # exp_sel = torch.distributions.Geometric(0.02).sample((bsz,)).to(device).clamp(max=n_experts-1).int()
-                # exp_sel = torch.randperm(n_experts, device=device, dtype=torch.int32)[exp_sel]
-                # sel = exp_sel
-
-                sel = cvmm_prepare_sel(sel, keys.shape[0])
-
-                # ref = cwmm_ref(testvec, sel, keys)
-                # out = cvmm_triton(testvec, sel, keys)
-
-                # if torch.allclose(out, ref, atol=5e-2, rtol=0):
-                #     print("✅ Triton and Torch match")
-                # else:
-                #     print("❌ Triton and Torch differ")
-
-                quantiles = [0.5, 0.2, 0.8]
-                if provider == 'cublas':
-                    ms, min_ms, max_ms = triton.testing.do_bench(lambda: torch.matmul(testvec, keys[0]), quantiles=quantiles)
-                if provider == 'triton':
-                    ms, min_ms, max_ms = triton.testing.do_bench(lambda: cvmm_triton(testvec, sel.sel_index, sel.sel, keys, dtype), quantiles=quantiles)
-                # if provider == 'cuda':
-                #     ms, min_ms, max_ms = triton.testing.do_bench(lambda: cvmm(testvec, sel, keys), quantiles=quantiles)
-                perf = lambda ms: 2 * bsz * N * K * 1e-12 / (ms * 1e-3)
-                # perf = lambda x: x
-                return perf(ms), perf(max_ms), perf(min_ms)
-
-
-            print(f"Benchmark: [bsz, {K}] @ [{n_experts}, {K}, {N}] -> [bsz, {N}]")
-            benchmark.run(show_plots=True, print_data=True)
-
-
-
-        do_benchmark(128, 512)
-        do_benchmark(256, 512)
-        do_benchmark(512, 128)
-
-
-    test_forward()
-
-
-    def test_backward():
-
-        def cvmm_ref_backward(x: torch.Tensor, sel: CVMMSel, grads: torch.Tensor, n_experts: int):
-            sel = sel.raw_sel
-
-            x = x.flatten(end_dim=-2).transpose(0,1)
-            gmats = []
-            for i in range(n_experts):
-                mask = sel != i
-                sel_my = torch.masked_fill(x, mask[None], 0)
-                grads_my = torch.masked_fill(grads, mask[:, None], 0)
-
-                gmats.append(sel_my @ grads_my)
-
-            return torch.stack(gmats)
-
-
-        torch.manual_seed(0)
-        n_experts = 8
-        n_channels = 64
-        expert_size = 64
-        bs = 64
-
-        # n_channels = 8
-        # expert_size = 8
-        # n_experts = 2
-        # bs=2
-
-        device = torch.device("cuda")
-        dtype = torch.float16
-        atol_tresh = 1e-2
-
-        testvec = torch.randn(bs, n_channels, dtype=dtype, device=device)
-        grads = torch.randn(bs, expert_size, dtype=dtype, device=device)
-
-        sel = torch.randint(0, n_experts, (bs,), dtype=torch.int32, device=device)
-        # exp_sel = torch.distributions.Geometric(0.02).sample((bs,)).to(device).clamp(max=n_experts-1).int()
-        # exp_sel = torch.randperm(n_experts, device=device, dtype=torch.int32)[exp_sel]
-        # sel = exp_sel
-
-        # sel = torch.tensor([0, 1], dtype=torch.int32, device=device)
-        # sel = torch.tensor([1, 0], dtype=torch.int32, device=device)
-
-
-        cvmmsel = cvmm_prepare_sel(sel, n_experts)
-        ref = cvmm_ref_backward(testvec, cvmmsel, grads, n_experts)
-        out = cvmm_triton_backward(testvec, cvmmsel.sel_index, cvmmsel.sel, grads, n_experts, key_dtype=ref.dtype, op_float16=dtype==torch.float16)
-
-
-
-        if torch.allclose(out, ref, atol=1e-2, rtol=0):
-            print("✅ Triton and Torch match")
-        else:
-            print("❌ Triton and Torch differ")
-
-
-
-
-        def do_benchmark(K, N):
-            @triton.testing.perf_report(
-                triton.testing.Benchmark(
-                    x_names=['bsz'],  # Argument names to use as an x-axis for the plot
-                    x_vals=[
-                        2048 * (i+2) for i in range(0, 32, 8)
-                    ]+[131072],  # Different possible values for `x_name`
-                    line_arg='provider',  # Argument name whose value corresponds to a different line in the plot
-                    # Possible values for `line_arg`
-                    line_vals=['cublas', 'triton'],
-                    # Label name for the lines
-                    line_names=["cuBLAS", "Triton"],
-                    # Line styles
-                    styles=[('green', '-'), ('blue', '-')],
-                    ylabel="TFLOPS",  # Label name for the y-axis
-                    plot_name="matmul-performance",  # Name for the plot, used also as a file name for saving the plot.
-                    args={},
-                )
-            )
-            def benchmark(bsz, provider):
-                # a = torch.randn((M, K), device='cuda', dtype=torch.float16)
-                # b = torch.randn((K, N), device='cuda', dtype=torch.float16)
-                dtype = torch.float32 if provider == 'cuda' else torch.float16
-                # dtype = torch.float32
-
-                sel = torch.randint(0, n_experts, (bs,), dtype=torch.int32, device=device)
-
-                testvec = torch.randn(bsz, K, dtype=dtype, device=device)
-                grads = torch.randn(bsz, N, dtype=dtype, device=device)
-                sel = torch.randint(0, n_experts, (bsz,), dtype=torch.int32, device=device)
-
-                exp_sel = torch.distributions.Geometric(0.02).sample((bsz,)).to(device).clamp(max=n_experts-1).int()
-                exp_sel = torch.randperm(n_experts, device=device, dtype=torch.int32)[exp_sel]
-                sel = exp_sel
-
-                sel = cvmm_prepare_sel(sel, n_experts)
-
-                # ref = cvmm_ref_backward(testvec, sel, grads, n_experts)
-                # out = cvmm_triton_backward(testvec, sel, grads, n_experts)
-
-                # if torch.allclose(out, ref, atol=5e-2, rtol=0):
-                #     print("✅ Triton and Torch match")
-                # else:
-                #     print("❌ Triton and Torch differ")
-
-                quantiles = [0.5, 0.2, 0.8]
-                if provider == 'cublas':
-                    ms, min_ms, max_ms = triton.testing.do_bench(lambda: torch.matmul(testvec.transpose(0,1), grads), quantiles=quantiles)
-                if provider == 'triton':
-                    ms, min_ms, max_ms = triton.testing.do_bench(lambda: cvmm_triton_backward(testvec, sel.sel_index, sel.sel, grads, n_experts, key_dtype=ref.dtype, op_float16=dtype==torch.float16), quantiles=quantiles)
-                # if provider == 'cuda':
-                #     ms, min_ms, max_ms = triton.testing.do_bench(lambda: cvmm(testvec, sel, keys), quantiles=quantiles)
-                perf = lambda ms: 2 * bsz * N * K * 1e-12 / (ms * 1e-3)
-                # perf = lambda x: x
-                return perf(ms), perf(max_ms), perf(min_ms)
-
-
-            print(f"Benchmark: [bsz, {K}] @ [{n_experts}, {K}, {N}] -> [bsz, {N}]")
-            benchmark.run(show_plots=True, print_data=True)
-
-
-
-        do_benchmark(128, 512)
-        do_benchmark(256, 512)
-        do_benchmark(512, 128)
-
-    test_backward()
